@@ -1,0 +1,119 @@
+name: lab-build
+
+# Compilacion de laboratorio de DroidBridge desde el tag oficial apk-v0.5.9 (commit fijado).
+# Genera la APK SIN FIRMAR. La firma se hace despues, fuera de GitHub, con el certificado de laboratorio.
+# No hay secretos, ni claves, ni cambios al codigo fuente original.
+on:
+  push:
+    branches: [lab/build-0.5.9]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PINNED_SOURCE_SHA: e070a70fa810bfbd7cf8eeba211aafe706844a53
+  ANDROID_NDK_VERSION: 29.0.14206865
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Verificar revision fija del codigo fuente
+        shell: bash
+        run: |
+          set -euo pipefail
+          # HEAD es el commit del workflow; su padre debe ser exactamente el tag oficial.
+          parent="$(git rev-parse HEAD~1)"
+          echo "padre=$parent esperado=$PINNED_SOURCE_SHA"
+          test "$parent" = "$PINNED_SOURCE_SHA"
+          # El unico cambio respecto al codigo fijado debe ser este workflow.
+          changed="$(git diff --name-only "$PINNED_SOURCE_SHA" HEAD)"
+          echo "cambios: $changed"
+          test "$changed" = ".github/workflows/lab-build.yml"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: SDK Android (plataforma 37, Build Tools 36.0.0, NDK 29, CMake 3.31.6)
+        shell: pwsh
+        run: |
+          $sdk = $env:ANDROID_HOME
+          if (-not $sdk) { $sdk = $env:ANDROID_SDK_ROOT }
+          "sdk=$sdk"
+          $sm = Join-Path $sdk 'cmdline-tools\latest\bin\sdkmanager.bat'
+          & $sm --sdk_root="$sdk" "platforms;android-37.0" "build-tools;36.0.0" "ndk;$env:ANDROID_NDK_VERSION" "cmake;3.31.6"
+          if ($LASTEXITCODE -ne 0) { throw "sdkmanager fallo ($LASTEXITCODE)" }
+          # check-toolchain.ps1 espera platforms/android-37; sdkmanager instala android-37.0.
+          if (-not (Test-Path "$sdk\platforms\android-37\android.jar")) {
+            New-Item -ItemType Junction -Path "$sdk\platforms\android-37" -Target "$sdk\platforms\android-37.0" | Out-Null
+          }
+          $fwd = $sdk.Replace([string][char]92, "/")
+          "sdk.dir=$fwd" | Set-Content -Encoding ascii local.properties
+          Get-Content local.properties
+
+      - name: Rust 1.98.0 y cargo-ndk 4.1.2
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.98.0 --profile minimal -t aarch64-linux-android -t x86_64-linux-android
+          rustup default 1.98.0
+          cargo install cargo-ndk --version 4.1.2 --locked
+          cargo ndk --version
+
+      - name: libpcap (script oficial)
+        shell: pwsh
+        run: ./tools/build-libpcap.ps1
+
+      - name: Comprobacion oficial de herramientas
+        shell: pwsh
+        run: ./tools/check-toolchain.ps1
+
+      - name: Completar 3 checksums faltantes de verificacion (solo en el runner)
+        shell: pwsh
+        run: |
+          # El metadata oficial no trae estos 3 artefactos que Gradle 9.6 pide en el classpath del build.
+          # SHA-256 calculados de Maven Central y contrastados con el .sha256 publicado
+          # (guava-parent: contrastado con el .sha1 publicado, Maven Central no publica .sha256 de ese pom).
+          # La verificacion sigue ESTRICTA; solo se agregan entradas, no se desactiva nada. Cambio no commiteado.
+          $f = "gradle/verification-metadata.xml"
+          $x = Get-Content $f -Raw
+          $add = @"
+            <component group="com.google.guava" name="guava-parent" version="33.4.0-jre"><artifact name="guava-parent-33.4.0-jre.pom"><sha256 value="3a499ed34a0d9ee0f1bcc39230021a1cd4e2f7dd0426ab6844f585465d41dcd7" origin="Lab: Maven Central sha1 verificado"/></artifact></component>
+            <component group="org.junit" name="junit-bom" version="5.10.2"><artifact name="junit-bom-5.10.2.module"><sha256 value="de23b114b3e4119a8fe6eb17bed5a3852816698bace67071579d6d927ebb080a" origin="Lab: Maven Central sha256"/></artifact></component>
+            <component group="org.junit" name="junit-bom" version="5.11.0-M2"><artifact name="junit-bom-5.11.0-M2.module"><sha256 value="86477abcf490d6ca059aa9973cb108d22a506f49d1a5569bb32cc6cbf43c2cce" origin="Lab: Maven Central sha256"/></artifact></component>
+          "@
+          $x = $x.Replace("</components>", $add + "</components>")
+          Set-Content $f $x -NoNewline -Encoding utf8
+          git diff --stat
+
+      - name: Compilar APK release (sin firmar)
+        shell: pwsh
+        run: ./gradlew.bat :standalone:assembleRelease --no-daemon --stacktrace
+
+      - name: Localizar y resumir la APK
+        id: apk
+        shell: pwsh
+        run: |
+          $apks = Get-ChildItem standalone\build\outputs\apk\release -Filter *.apk -Recurse
+          $apks | ForEach-Object { "{0} {1} bytes" -f $_.FullName, $_.Length }
+          if ($apks.Count -ne 1) { throw "se esperaba exactamente 1 APK, hay $($apks.Count)" }
+          $dest = 'out'; New-Item -ItemType Directory -Force $dest | Out-Null
+          Copy-Item $apks[0].FullName "$dest\droidbridge-0.5.9-lab-unsigned.apk"
+          $h = (Get-FileHash "$dest\droidbridge-0.5.9-lab-unsigned.apk" -Algorithm SHA256).Hash.ToLower()
+          "$h  droidbridge-0.5.9-lab-unsigned.apk" | Set-Content -Encoding ascii "$dest\SHA256SUMS.txt"
+          "sha256=$h"
+          "source_sha=$env:PINNED_SOURCE_SHA`nworkflow_sha=$env:GITHUB_SHA`nrunner=$env:ImageOS $env:ImageVersion" | Set-Content -Encoding ascii "$dest\BUILD-INFO.txt"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: droidbridge-0.5.9-lab-unsigned
+          path: out/
+          retention-days: 14
+          if-no-files-found: error
